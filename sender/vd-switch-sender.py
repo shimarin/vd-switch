@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vd-switch foot switch sender
-Reads key 1/2/3 from a foot switch and sends IPv6 link-local multicast
+Reads key a/b/c from a foot switch and sends IPv6 link-local multicast
 packets to vd-switch.exe listeners on the local network.
 
 Keys a/b/c map to actions decided by the receiver.
@@ -11,6 +11,7 @@ import argparse
 import socket
 import struct
 import sys
+import time
 
 try:
     import evdev
@@ -21,6 +22,7 @@ except ImportError:
 
 MULTICAST_ADDR = 'ff12::7664:7377'
 PORT = 5356
+RETRY_INTERVAL = 5  # seconds between retries when device is unavailable
 
 TARGET_KEYS = {
     ecodes.KEY_A: b'a',
@@ -51,7 +53,7 @@ def open_socket(ifname):
 
 
 def find_devices():
-    """Return input devices that have KEY_1, KEY_2, KEY_3 in their capabilities."""
+    """Return input devices that have KEY_A, KEY_B, KEY_C in their capabilities."""
     result = []
     for path in evdev.list_devices():
         try:
@@ -64,6 +66,26 @@ def find_devices():
         except (OSError, PermissionError):
             pass
     return result
+
+
+def try_open_device(args):
+    """Try to open the input device. Returns the device or None if not available."""
+    if args.device:
+        try:
+            return evdev.InputDevice(args.device)
+        except (OSError, PermissionError):
+            return None
+    else:
+        devices = find_devices()
+        if not devices:
+            return None
+        if len(devices) > 1:
+            # Multiple candidates: hard error, user must specify --device
+            print("Multiple candidate devices found. Specify one with --device:", file=sys.stderr)
+            for dev in devices:
+                print(f"  {dev.path}  {dev.name}", file=sys.stderr)
+            sys.exit(1)
+        return devices[0]
 
 
 def main():
@@ -84,7 +106,7 @@ def main():
     if args.list:
         devices = find_devices()
         if not devices:
-            print("No devices with KEY_1/2/3 found (permission issue?)")
+            print("No devices with KEY_A/B/C found (permission issue?)")
         else:
             print("Candidate devices:")
             for dev in devices:
@@ -97,58 +119,54 @@ def main():
         print("No interface with fe80:: address found. Use --interface.", file=sys.stderr)
         sys.exit(1)
 
-    # ── input device ────────────────────────────────────────────────────────
-    if args.device:
-        try:
-            device = evdev.InputDevice(args.device)
-        except (OSError, PermissionError) as e:
-            print(f"Cannot open {args.device}: {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        devices = find_devices()
-        if not devices:
-            print("No suitable input device found.", file=sys.stderr)
-            print("Try: sudo python3 sender.py --list", file=sys.stderr)
-            sys.exit(1)
-        if len(devices) > 1:
-            print("Multiple candidate devices found. Specify one with --device:", file=sys.stderr)
-            for dev in devices:
-                print(f"  {dev.path}  {dev.name}", file=sys.stderr)
-            sys.exit(1)
-        device = devices[0]
-
     sock, ifindex = open_socket(ifname)
     dest = (MULTICAST_ADDR, PORT, 0, ifindex)
-
-    print(f"Device   : {device.path} ({device.name})")
     print(f"Interface: {ifname}")
     print(f"Multicast: [{MULTICAST_ADDR}%{ifname}]:{PORT}")
-    if args.grab:
-        device.grab()
-        print("Device grabbed (keys suppressed in other apps)")
-    print("Listening for keys 1 / 2 / 3 ...  Ctrl-C to quit")
 
+    # ── main loop with retry ─────────────────────────────────────────────────
     try:
-        for event in device.read_loop():
-            if event.type != ecodes.EV_KEY:
+        while True:
+            device = try_open_device(args)
+            if device is None:
+                label = args.device if args.device else 'suitable device'
+                print(f"Waiting for {label} (retry every {RETRY_INTERVAL}s)...")
+                time.sleep(RETRY_INTERVAL)
                 continue
-            key_event = evdev.categorize(event)
-            if key_event.keystate != evdev.KeyEvent.key_down:
-                continue
-            payload = TARGET_KEYS.get(key_event.scancode)
-            if payload is None:
-                continue
-            sock.sendto(payload, dest)
-            print(f"  sent: {payload.decode()}")
+
+            print(f"Device   : {device.path} ({device.name})")
+            if args.grab:
+                device.grab()
+                print("Device grabbed (keys suppressed in other apps)")
+            print("Listening for keys a / b / c ...")
+
+            try:
+                for event in device.read_loop():
+                    if event.type != ecodes.EV_KEY:
+                        continue
+                    key_event = evdev.categorize(event)
+                    if key_event.keystate != evdev.KeyEvent.key_down:
+                        continue
+                    payload = TARGET_KEYS.get(key_event.scancode)
+                    if payload is None:
+                        continue
+                    sock.sendto(payload, dest)
+                    print(f"  sent: {payload.decode()}")
+            except OSError as e:
+                print(f"Device error: {e} — retrying in {RETRY_INTERVAL}s...")
+            finally:
+                try:
+                    if args.grab:
+                        device.ungrab()
+                except OSError:
+                    pass
+                device.close()
+
+            time.sleep(RETRY_INTERVAL)
+
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        if args.grab:
-            try:
-                device.ungrab()
-            except OSError:
-                pass
-        device.close()
         sock.close()
 
 
