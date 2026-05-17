@@ -1,0 +1,11 @@
+[Unit]
+Description=vd-switch foot switch sender
+After=local-fs.target
+
+[Service]
+ExecStart=@PREFIX@/bin/vd-switch-sender --grab
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
