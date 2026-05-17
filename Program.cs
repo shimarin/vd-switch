@@ -78,8 +78,10 @@ static async Task<int> ListenAsync()
 
     Console.WriteLine($"Interface: {iface.Value.Name}");
     Console.WriteLine($"Multicast: [{MulticastAddr}%{iface.Value.Name}]:{MulticastPort}");
-    Console.WriteLine("  a=prev  b=next  c=desktop 0");
+    Console.WriteLine("  a=desktop 0  b=desktop 1  c=desktop 2");
     Console.WriteLine("Ctrl-C to quit");
+
+    var keyMap = new Dictionary<string, int> { ["a"] = 0, ["b"] = 1, ["c"] = 2 };
 
     var buf = new byte[16];
     while (!cts.IsCancellationRequested)
@@ -92,24 +94,21 @@ static async Task<int> ListenAsync()
         catch (OperationCanceledException) { break; }
 
         var key = Encoding.UTF8.GetString(buf, 0, len).Trim();
-        int cur = Desktop.FromDesktop(Desktop.Current);
-        switch (key)
+        if (keyMap.TryGetValue(key, out int target))
         {
-            case "a":
-                if (cur > 0) Desktop.FromIndex(cur - 1).MakeVisible();
-                Console.WriteLine($"[a] prev  {cur} → {Math.Max(cur - 1, 0)}");
-                break;
-            case "b":
-                if (cur < Desktop.Count - 1) Desktop.FromIndex(cur + 1).MakeVisible();
-                Console.WriteLine($"[b] next  {cur} → {Math.Min(cur + 1, Desktop.Count - 1)}");
-                break;
-            case "c":
-                Desktop.FromIndex(0).MakeVisible();
-                Console.WriteLine($"[c] home  {cur} → 0");
-                break;
-            default:
-                Console.WriteLine($"[?] unknown key: {key}");
-                break;
+            if (target < Desktop.Count)
+            {
+                Desktop.FromIndex(target).MakeVisible();
+                Console.WriteLine($"[{key}] → desktop {target}");
+            }
+            else
+            {
+                Console.WriteLine($"[{key}] desktop {target} does not exist (count={Desktop.Count})");
+            }
+        }
+        else
+        {
+            Console.WriteLine($"[?] unknown key: {key}");
         }
     }
 
