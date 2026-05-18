@@ -73,10 +73,15 @@ static class Program
         {
             using var raw     = Icon.FromHandle(hIcon).ToBitmap();
             using var trimmed = TrimTransparent(raw);
+            float scale  = Math.Min((float)displaySize / trimmed.Width, (float)displaySize / trimmed.Height);
+            int   drawW  = (int)(trimmed.Width  * scale);
+            int   drawH  = (int)(trimmed.Height * scale);
+            int   offsetX = (displaySize - drawW) / 2;
+            int   offsetY = (displaySize - drawH) / 2;
             var dst = new Bitmap(displaySize, displaySize);
             using var g = Graphics.FromImage(dst);
             g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.DrawImage(trimmed, 0, 0, displaySize, displaySize);
+            g.DrawImage(trimmed, offsetX, offsetY, drawW, drawH);
             return dst;
         }
         finally { DestroyIcon(hIcon); }
