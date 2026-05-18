@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
@@ -12,6 +14,97 @@ static class Program
 {
     const string MulticastAddr = "ff12::7664:7377";
     const int MulticastPort = 5356;
+
+    static readonly Control _invoker = new();
+    static Form? _launcherForm;
+
+    static string QuickLaunchPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        @"Microsoft\Internet Explorer\Quick Launch");
+
+    // ── Shell icon extraction (256×256 jumbo) ────────────────────────────────
+
+    [ComImport, Guid("46EB5926-582E-4017-9FDF-E8998DAA0950"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IImageList
+    {
+        [PreserveSig] int Add(IntPtr hbmImage, IntPtr hbmMask, out int pi);
+        [PreserveSig] int ReplaceIcon(int i, IntPtr hicon, out int pi);
+        [PreserveSig] int SetOverlayImage(int iImage, int iOverlay);
+        [PreserveSig] int Replace(int i, IntPtr hbmImage, IntPtr hbmMask);
+        [PreserveSig] int AddMasked(IntPtr hbmImage, int crMask, out int pi);
+        [PreserveSig] int Draw(IntPtr pimldp);
+        [PreserveSig] int Remove(int i);
+        [PreserveSig] int GetIcon(int i, int flags, out IntPtr picon);
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SHFILEINFO
+    {
+        public IntPtr hIcon;
+        public int iIcon;
+        public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]  public string szTypeName;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
+        ref SHFILEINFO psfi, uint cbSizeFileInfo, uint uFlags);
+
+    [DllImport("shell32.dll")]
+    static extern int SHGetImageList(int iImageList, ref Guid riid, out IImageList ppv);
+
+    [DllImport("user32.dll")]
+    static extern bool DestroyIcon(IntPtr hIcon);
+
+    static Bitmap? ExtractJumboIcon(string path, int displaySize)
+    {
+        const uint SHGFI_SYSICONINDEX = 0x4000;
+        const int  SHIL_JUMBO        = 0x4;
+        const int  ILD_TRANSPARENT   = 0x1;
+        var iid  = new Guid("46EB5926-582E-4017-9FDF-E8998DAA0950");
+        var shfi = new SHFILEINFO();
+        if (SHGetFileInfo(path, 0, ref shfi, (uint)Marshal.SizeOf(shfi), SHGFI_SYSICONINDEX) == IntPtr.Zero)
+            return null;
+        if (SHGetImageList(SHIL_JUMBO, ref iid, out var list) != 0) return null;
+        if (list.GetIcon(shfi.iIcon, ILD_TRANSPARENT, out var hIcon) != 0) return null;
+        try
+        {
+            using var raw     = Icon.FromHandle(hIcon).ToBitmap();
+            using var trimmed = TrimTransparent(raw);
+            var dst = new Bitmap(displaySize, displaySize);
+            using var g = Graphics.FromImage(dst);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(trimmed, 0, 0, displaySize, displaySize);
+            return dst;
+        }
+        finally { DestroyIcon(hIcon); }
+    }
+
+    static Bitmap TrimTransparent(Bitmap src)
+    {
+        int minX = src.Width, minY = src.Height, maxX = 0, maxY = 0;
+        var data = src.LockBits(new Rectangle(0, 0, src.Width, src.Height),
+            System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            for (int y = 0; y < src.Height; y++)
+            for (int x = 0; x < src.Width; x++)
+            {
+                byte alpha = Marshal.ReadByte(data.Scan0, y * data.Stride + x * 4 + 3);
+                if (alpha == 0) continue;
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+            }
+        }
+        finally { src.UnlockBits(data); }
+        if (minX > maxX) return src; // fully transparent — return as-is
+        return src.Clone(Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1), src.PixelFormat);
+    }
 
     [STAThread]
     static void Main(string[] args)
@@ -30,6 +123,7 @@ static class Program
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        _invoker.CreateControl();
 
         var cts = new CancellationTokenSource();
 
@@ -100,7 +194,7 @@ static class Program
             switch (parts[0])
             {
                 case "KEY_A": SwitchRelative(-1); break;
-                case "KEY_B": OpenTaskView();     break;
+                case "KEY_B": ShowLauncher(); break;
                 case "KEY_C": SwitchRelative(+1); break;
             }
         }
@@ -127,17 +221,88 @@ static class Program
         catch { }
     }
 
-    static void OpenTaskView()
+    static void ShowLauncher() => _invoker.BeginInvoke(ShowLauncherUI);
+
+    static void ShowLauncherUI()
     {
-        try
+        if (_launcherForm is { IsDisposed: false })
         {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}",
-                UseShellExecute = true,
-            });
+            _launcherForm.Close();
+            return;
         }
-        catch { }
+
+        var entries = Directory.Exists(QuickLaunchPath)
+            ? Directory.GetFiles(QuickLaunchPath)
+                .Where(f => (File.GetAttributes(f) &
+                             (FileAttributes.Hidden | FileAttributes.System)) == 0)
+                .OrderBy(Path.GetFileNameWithoutExtension)
+                .ToArray()
+            : [];
+
+        if (entries.Length == 0) return;
+
+        const int iconSize = 128, tileW = 180, tileH = 180;
+        var screen = Screen.PrimaryScreen ?? Screen.FromPoint(Cursor.Position);
+        int screenW = screen.WorkingArea.Width;
+        int maxCols = Math.Max(1, (screenW - 32) / tileW);
+        int rows = (int)Math.Ceiling((double)entries.Length / maxCols);
+        int cols = (int)Math.Ceiling((double)entries.Length / rows);
+
+        var panel = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Width  = cols * tileW + 8,
+            Height = rows * tileH + 8,
+            Padding = new Padding(4),
+        };
+
+        foreach (var path in entries)
+        {
+            var p = path;
+            var name = Path.GetFileNameWithoutExtension(path);
+            Bitmap? img = null;
+            try { img = ExtractJumboIcon(path, iconSize); } catch { }
+
+            var btn = new Button
+            {
+                Text = name,
+                Image = img,
+                ImageAlign = ContentAlignment.TopCenter,
+                TextAlign = ContentAlignment.BottomCenter,
+                TextImageRelation = TextImageRelation.ImageAboveText,
+                Width = tileW,
+                Height = tileH,
+                Padding = new Padding(4),
+            };
+            btn.Click += (_, _) =>
+            {
+                _launcherForm?.Close();
+                try { Process.Start(new ProcessStartInfo { FileName = p, UseShellExecute = true }); }
+                catch { }
+            };
+            panel.Controls.Add(btn);
+        }
+
+        _launcherForm = new Form
+        {
+            Text = "Quick Launch",
+            FormBorderStyle = FormBorderStyle.FixedToolWindow,
+            StartPosition = FormStartPosition.Manual,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            TopMost = true,
+            KeyPreview = true,
+        };
+        _launcherForm.Controls.Add(panel);
+        _launcherForm.KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) _launcherForm?.Close(); };
+        _launcherForm.Deactivate += (_, _) => _launcherForm?.Close();
+        _launcherForm.Show();
+        var wa = screen.WorkingArea;
+        _launcherForm.Location = new Point(
+            wa.X + (wa.Width  - _launcherForm.Width)  / 2,
+            wa.Y + (wa.Height - _launcherForm.Height) / 2);
+        _launcherForm.Activate();
     }
 
     // ── CLI mode (引数あり) ──────────────────────────────────────────────────
