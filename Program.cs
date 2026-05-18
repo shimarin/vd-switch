@@ -114,6 +114,8 @@ static class Program
             Environment.Exit(RunCli(args));
             return;
         }
+        using var mutex = new Mutex(true, @"Local\vd-switch", out bool createdNew);
+        if (!createdNew) return;
         RunTray();
     }
 
@@ -252,8 +254,8 @@ static class Program
         {
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
-            Width  = cols * tileW + 8,
-            Height = rows * tileH + 8,
+            Width  = cols * (tileW + 6) + 8,
+            Height = rows * (tileH + 6) + 8,
             Padding = new Padding(4),
         };
 
