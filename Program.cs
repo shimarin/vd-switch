@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -86,17 +87,22 @@ static class Program
         sock.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.AddMembership,
             new IPv6MulticastOption(IPAddress.Parse(MulticastAddr), iface.Value.Index));
 
-        var buf = new byte[16];
+        var buf = new byte[32];
         while (!ct.IsCancellationRequested)
         {
             int len;
             try { len = await sock.ReceiveAsync(buf, ct); }
             catch (OperationCanceledException) { break; }
 
-            var key = Encoding.UTF8.GetString(buf, 0, len).Trim();
-            int target = key switch { "a" => 0, "b" => 1, "c" => 2, _ => -1 };
-            if (target >= 0)
-                SwitchDesktop(target);
+            // Protocol: "KEY_X DOWN" or "KEY_X UP" (UDP, UP may be lost — receiver's responsibility)
+            var parts = Encoding.UTF8.GetString(buf, 0, len).Trim().Split(' ');
+            if (parts.Length != 2 || parts[1] != "DOWN") continue;
+            switch (parts[0])
+            {
+                case "KEY_A": SwitchRelative(-1); break;
+                case "KEY_B": OpenTaskView();     break;
+                case "KEY_C": SwitchRelative(+1); break;
+            }
         }
     }
 
@@ -104,8 +110,32 @@ static class Program
     {
         try
         {
-            if (index < Desktop.Count)
+            if (index >= 0 && index < Desktop.Count)
                 Desktop.FromIndex(index).MakeVisible();
+        }
+        catch { }
+    }
+
+    static void SwitchRelative(int delta)
+    {
+        try
+        {
+            int next = Desktop.FromDesktop(Desktop.Current) + delta;
+            if (next >= 0 && next < Desktop.Count)
+                Desktop.FromIndex(next).MakeVisible();
+        }
+        catch { }
+    }
+
+    static void OpenTaskView()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}",
+                UseShellExecute = true,
+            });
         }
         catch { }
     }
